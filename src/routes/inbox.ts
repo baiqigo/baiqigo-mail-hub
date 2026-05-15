@@ -295,7 +295,7 @@ inboxRoutes.get('/inbox/:id/code', async (c) => {
         const interval = elapsed < 20000 ? 3000 : 5000;
         await new Promise((r) => setTimeout(r, interval));
         if (c.req.raw.signal.aborted) break;
-        messages = sortNewest(filterNew(await pollProvider(providerName, provider, inbox)));
+        try { messages = sortNewest(filterNew(await pollProvider(providerName, provider, inbox))); } catch { /* retry next cycle */ }
         if (messages.length > 0) break;
       }
     }
