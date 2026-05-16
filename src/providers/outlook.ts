@@ -347,9 +347,25 @@ export class OutlookProvider extends BaseProvider {
   }
 }
 
-export async function checkToken(email: string, clientId: string, refreshToken: string): Promise<boolean> {
+export async function checkToken(email: string, clientId: string, refreshToken: string): Promise<{ valid: boolean; apiType: string }> {
   const token = await obtainAccessToken(clientId, refreshToken);
-  return !!token;
+  if (!token) return { valid: false, apiType: '' };
+
+  try {
+    const res = await fetchWithTimeout(`${GRAPH_INBOX_URL}?$top=1`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (res.ok) return { valid: true, apiType: 'graph' };
+  } catch {}
+
+  try {
+    const res = await fetchWithTimeout(`${OUTLOOK_INBOX_URL}?$top=1`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (res.ok) return { valid: true, apiType: 'outlook' };
+  } catch {}
+
+  return { valid: false, apiType: '' };
 }
 
 export async function renewToken(clientId: string, refreshToken: string): Promise<{ newRefreshToken: string; accessToken: string } | null> {

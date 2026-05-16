@@ -124,16 +124,23 @@ outlookRoutes.post('/outlook/check', async (c) => {
 
   const rows = allRows<{ email: string; client_id: string; refresh_token: string }>(db, sql, ...(body.emails ?? []));
 
-  const results: { email: string; valid: boolean }[] = [];
+  const results: { email: string; valid: boolean; apiType?: string }[] = [];
   for (const row of rows) {
     if (!row.client_id || !row.refresh_token) {
       db.prepare(`UPDATE outlook_accounts SET token_status = 'no_token' WHERE email = ?`).run(row.email);
       results.push({ email: row.email, valid: false });
       continue;
     }
-    const valid = await checkToken(row.email, row.client_id, row.refresh_token);
-    db.prepare(`UPDATE outlook_accounts SET token_status = ? WHERE email = ?`).run(valid ? 'valid' : 'invalid', row.email);
-    results.push({ email: row.email, valid });
+    const { valid, apiType } = await checkToken(row.email, row.client_id, row.refresh_token);
+    const updates = [`token_status = ?`];
+    const params: any[] = [valid ? 'valid' : 'invalid'];
+    if (apiType) {
+      updates.push(`api_type = ?`);
+      params.push(apiType);
+    }
+    params.push(row.email);
+    db.prepare(`UPDATE outlook_accounts SET ${updates.join(', ')} WHERE email = ?`).run(...params);
+    results.push({ email: row.email, valid, apiType });
   }
 
   return c.json({
