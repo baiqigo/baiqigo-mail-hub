@@ -336,12 +336,30 @@ inboxRoutes.get('/inbox/:id/code', async (c) => {
 inboxRoutes.delete('/inbox/:id', async (c) => {
   const id = c.req.param('id');
   const db = getDb();
-  const row = getInboxRow<{ id: string; provider: string; address: string; auth_data: string; api_base: string | null }>(c, id, 'id, provider, address, auth_data, api_base');
+  const claimParams: QueryParam[] = [id];
+  let claimSql = `
+    UPDATE inboxes
+    SET status = 'closed'
+    WHERE id = ? AND status != 'closed'
+  `;
+  if (!c.get('isAdmin')) {
+    claimSql += ` AND owner_key = ?`;
+    claimParams.push(c.get('apiKey'));
+  }
+  claimSql += ` RETURNING id, provider, address, auth_data, api_base`;
+
+  const row = getRow<{ id: string; provider: string; address: string; auth_data: string; api_base: string | null }>(
+    db,
+    claimSql,
+    ...claimParams,
+  );
   if (!row) {
-    return c.json({ error: 'Inbox not found' }, 404);
+    const existing = getInboxRow<{ id: string }>(c, id, 'id');
+    if (!existing) return c.json({ error: 'Inbox not found' }, 404);
+    return c.json({ ok: true });
   }
 
-  const inbox = parseStoredInbox(row as { id: string; provider: string; address: string; auth_data: string; api_base: string | null });
+  const inbox = parseStoredInbox(row);
   const provider = registry.get(inbox.provider);
 
   if (provider?.deleteInbox) {
@@ -354,7 +372,6 @@ inboxRoutes.delete('/inbox/:id', async (c) => {
     await releaseInboxResources(inbox, { deleteExternal: false });
   }
 
-  db.prepare(`UPDATE inboxes SET status = 'closed' WHERE id = ?`).run(id);
   logActivity('amber', `Closed inbox ${inbox.address} (${inbox.provider})`);
   return c.json({ ok: true });
 });

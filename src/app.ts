@@ -386,23 +386,41 @@ export function createApp(): Hono<AdminEnv> {
     try {
       const db = getDb();
       const keyHash = hashApiKey(token);
-      const valid = getRow<{
-        key: string; daily_limit: number | null; daily_calls: number; daily_reset_at: string | null;
-      }>(db, `SELECT key, daily_limit, daily_calls, daily_reset_at FROM api_keys WHERE key = ? AND active = 1`, keyHash);
-      if (valid) {
-        const today = todayDateString();
-        const dailyCalls = valid.daily_reset_at?.startsWith(today) ? valid.daily_calls : 0;
-        if (valid.daily_limit !== null && dailyCalls >= valid.daily_limit) {
-          return c.json({ error: 'Daily quota exceeded' }, 429);
-        }
+      const today = todayDateString();
+      const consumed = getRow<{ key: string }>(db, `
+        UPDATE api_keys
+        SET
+          call_count = call_count + 1,
+          daily_calls = CASE
+            WHEN daily_reset_at LIKE ? THEN daily_calls + 1
+            ELSE 1
+          END,
+          daily_reset_at = ?,
+          last_used_at = datetime('now')
+        WHERE key = ?
+          AND active = 1
+          AND (
+            daily_limit IS NULL
+            OR (CASE WHEN daily_reset_at LIKE ? THEN daily_calls ELSE 0 END) < daily_limit
+          )
+        RETURNING key
+      `, `${today}%`, today, keyHash, `${today}%`);
+      if (consumed) {
         c.set('isAdmin', false);
         c.set('apiKey', keyHash);
-        if (valid.daily_reset_at?.startsWith(today)) {
-          db.prepare(`UPDATE api_keys SET call_count = call_count + 1, daily_calls = daily_calls + 1, last_used_at = datetime('now') WHERE key = ?`).run(keyHash);
-        } else {
-          db.prepare(`UPDATE api_keys SET call_count = call_count + 1, daily_calls = 1, daily_reset_at = ?, last_used_at = datetime('now') WHERE key = ?`).run(today, keyHash);
-        }
         return next();
+      }
+
+      const existing = getRow<{ daily_limit: number | null }>(
+        db,
+        `SELECT daily_limit FROM api_keys WHERE key = ? AND active = 1`,
+        keyHash,
+      );
+      if (existing) {
+        if (existing.daily_limit !== null) {
+          return c.json({ error: 'Daily quota exceeded' }, 429);
+        }
+        createLogger('auth').error('failed to consume unlimited API key quota', { key: keyHash });
       }
     } catch (e) {
       createLogger('auth').error('auth middleware error', { error: errorMessage(e) });

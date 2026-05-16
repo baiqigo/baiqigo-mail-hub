@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { getDb } from '../src/db.js';
+import { getDb, getRow } from '../src/db.js';
 import { hashApiKey } from '../src/crypto.js';
 import { app, authHeaders, jsonHeaders } from './helpers/http.js';
 
@@ -43,5 +43,24 @@ describe('API authentication and admin boundaries', () => {
     });
 
     expect(res.status).toBe(201);
+  });
+
+  it('consumes daily API key quota atomically', async () => {
+    const keyHash = hashApiKey('mk_limited');
+    getDb().prepare(
+      `INSERT INTO api_keys (key, name, daily_limit, daily_calls, daily_reset_at) VALUES (?, ?, 1, 0, ?)`,
+    ).run(keyHash, 'limited', new Date().toISOString().slice(0, 10));
+
+    const first = await app.request('/api/providers', { headers: authHeaders('mk_limited') });
+    const second = await app.request('/api/providers', { headers: authHeaders('mk_limited') });
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(429);
+    const row = getRow<{ call_count: number; daily_calls: number }>(
+      getDb(),
+      `SELECT call_count, daily_calls FROM api_keys WHERE key = ?`,
+      keyHash,
+    );
+    expect(row).toEqual({ call_count: 1, daily_calls: 1 });
   });
 });

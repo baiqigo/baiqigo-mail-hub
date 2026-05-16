@@ -56,4 +56,20 @@ describe('inbox ownership isolation', () => {
     expect(ownerRead.status).toBe(200);
     registry.unregister('fake');
   });
+
+  it('claims inbox deletion once when requests race', async () => {
+    const provider = new FakeProvider();
+    registry.register(provider);
+    addKey('owner-a');
+    addOwnedInbox('delete-race', 'owner-a');
+
+    const [first, second] = await Promise.all([
+      app.request('/api/inbox/delete-race', { method: 'DELETE', headers: authHeaders('owner-a') }),
+      app.request('/api/inbox/delete-race', { method: 'DELETE', headers: authHeaders('owner-a') }),
+    ]);
+
+    expect([first.status, second.status].sort()).toEqual([200, 200]);
+    expect(provider.deleteCount).toBe(1);
+    registry.unregister('fake');
+  });
 });
