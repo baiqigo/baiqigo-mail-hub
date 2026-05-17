@@ -29,6 +29,17 @@ function stripHtml(html: string): string {
     .trim();
 }
 
+function decodeHtmlEntities(value: string): string {
+  return value
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex: string) => String.fromCharCode(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, dec: string) => String.fromCharCode(parseInt(dec, 10)))
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>');
+}
+
 function extractContext(text: string, pos: number, radius = 40): string {
   const start = Math.max(0, pos - radius);
   const end = Math.min(text.length, pos + radius);
@@ -89,7 +100,7 @@ function extractLinks(html: string): ExtractedCode[] {
   let match: RegExpExecArray | null;
 
   while ((match = re.exec(html)) !== null) {
-    const url = match[1];
+    const url = decodeHtmlEntities(match[1]);
     if (!url.startsWith('http')) continue;
     if (!LINK_KEYWORDS.test(url)) continue;
     if (/unsubscribe/i.test(url)) continue;

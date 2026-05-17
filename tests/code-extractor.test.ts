@@ -105,6 +105,16 @@ describe('code-extractor', () => {
       const link = results.find(r => r.type === 'link');
       expect(link!.confidence).toBeGreaterThanOrEqual(0.9);
     });
+
+    it('decodes HTML entities in href values', () => {
+      const html = '<a href="https://replit.com/action-code?mode=verifyEmail&amp;oobCode=abc123&amp;apiKey=key&amp;lang=en">Verify</a>';
+      const results = extractCodes({ subject: '', html });
+      const link = results.find(r => r.type === 'link');
+
+      expect(link).toBeDefined();
+      expect(link!.value).toBe('https://replit.com/action-code?mode=verifyEmail&oobCode=abc123&apiKey=key&lang=en');
+      expect(link!.value).not.toContain('&amp;');
+    });
   });
 
   describe('HTML handling', () => {
