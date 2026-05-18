@@ -1,8 +1,8 @@
 import { Hono } from 'hono';
-import { allRows, getDb, getRow, logActivity } from '../db.js';
+import { allRows, getDb, getRow, getSetting, logActivity } from '../db.js';
 import { requireAdmin, type AdminEnv } from './admin.js';
 import { importDelimited } from '../import-utils.js';
-import { fetchWithTimeout } from '../utils.js';
+import { fetchWithTimeout, runConcurrent } from '../utils.js';
 import { createLogger } from '../logger.js';
 import { errorMessage } from '../errors.js';
 
@@ -54,6 +54,7 @@ yydsRoutes.delete('/yyds/accounts', async (c) => {
 yydsRoutes.post('/yyds/check', async (c) => {
   const body = await c.req.json().catch(() => ({}));
   const db = getDb();
+  const concurrency = Math.max(1, parseInt(getSetting('batch_concurrency', '5'), 10) || 5);
 
   let sql = `SELECT api_key FROM yyds_accounts`;
   if (body.keys?.length) {
@@ -63,8 +64,7 @@ yydsRoutes.post('/yyds/check', async (c) => {
 
   const rows = allRows<{ api_key: string }>(db, sql, ...(body.keys ?? []));
 
-  const results: { key: string; valid: boolean }[] = [];
-  for (const row of rows) {
+  const results = await runConcurrent(rows, concurrency, async (row) => {
     try {
       const res = await fetchWithTimeout('https://maliapi.215.im/v1/accounts', {
         method: 'POST',
@@ -73,13 +73,14 @@ yydsRoutes.post('/yyds/check', async (c) => {
       });
       const valid = res.status !== 403 && res.status !== 401;
       db.prepare(`UPDATE yyds_accounts SET status = ? WHERE api_key = ?`).run(valid ? 'active' : 'invalid', row.api_key);
-      results.push({ key: row.api_key, valid });
+      return { key: row.api_key, valid };
     } catch (error) {
       log.warn('YYDS key check request failed', { key: row.api_key, error: errorMessage(error) });
       db.prepare(`UPDATE yyds_accounts SET status = 'invalid' WHERE api_key = ?`).run(row.api_key);
-      results.push({ key: row.api_key, valid: false });
+      return { key: row.api_key, valid: false };
     }
-  }
+  });
+
   const validCount = results.filter((r) => r.valid).length;
   const invalidCount = results.filter((r) => !r.valid).length;
   logActivity('blue', `Batch checked YYDS keys: ${validCount} valid / ${invalidCount} invalid`);

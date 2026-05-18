@@ -18,6 +18,7 @@ export const DEFAULT_SETTINGS = {
   retention_faillog_days: '7',
   retention_inbox_days: '7',
   proxy_url: '',
+  batch_concurrency: '5',
 } as const;
 
 export type BackupInfo = {

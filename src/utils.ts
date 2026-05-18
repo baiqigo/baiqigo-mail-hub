@@ -49,6 +49,19 @@ function isNetworkError(e: unknown): boolean {
   return false;
 }
 
+export async function runConcurrent<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = [];
+  let i = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (i < items.length) {
+      const idx = i++;
+      results[idx] = await fn(items[idx]);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 export async function fetchWithTimeout(
   url: string,
   opts: RequestInit & { timeout?: number; retries?: number } = {},

@@ -3,6 +3,7 @@ import { allRows, getDb, getRow, getSetting, logActivity, setSetting } from '../
 import { checkToken, renewToken } from '../providers/outlook.js';
 import { requireAdmin, type AdminEnv } from './admin.js';
 import { importDelimited } from '../import-utils.js';
+import { runConcurrent } from '../utils.js';
 
 export function parseCredentials(parts: string[]): { clientId: string; refreshToken: string } {
   const fields = parts.slice(2).map(s => s.trim()).filter(Boolean);
@@ -115,6 +116,7 @@ outlookRoutes.delete('/outlook/accounts', async (c) => {
 outlookRoutes.post('/outlook/check', async (c) => {
   const body = await c.req.json().catch(() => ({}));
   const db = getDb();
+  const concurrency = Math.max(1, parseInt(getSetting('batch_concurrency', '5'), 10) || 5);
 
   let sql = `SELECT email, client_id, refresh_token FROM outlook_accounts`;
   if (body.emails?.length) {
@@ -124,24 +126,30 @@ outlookRoutes.post('/outlook/check', async (c) => {
 
   const rows = allRows<{ email: string; client_id: string; refresh_token: string }>(db, sql, ...(body.emails ?? []));
 
-  const results: { email: string; valid: boolean; apiType?: string }[] = [];
+  const noToken: typeof rows = [];
+  const withToken: typeof rows = [];
   for (const row of rows) {
-    if (!row.client_id || !row.refresh_token) {
-      db.prepare(`UPDATE outlook_accounts SET token_status = 'no_token' WHERE email = ?`).run(row.email);
-      results.push({ email: row.email, valid: false });
-      continue;
-    }
+    (row.client_id && row.refresh_token ? withToken : noToken).push(row);
+  }
+
+  for (const row of noToken) {
+    db.prepare(`UPDATE outlook_accounts SET token_status = 'no_token' WHERE email = ?`).run(row.email);
+  }
+
+  const checked = await runConcurrent(withToken, concurrency, async (row) => {
     const { valid, apiType } = await checkToken(row.email, row.client_id, row.refresh_token);
     const updates = [`token_status = ?`];
     const params: any[] = [valid ? 'valid' : 'invalid'];
-    if (apiType) {
-      updates.push(`api_type = ?`);
-      params.push(apiType);
-    }
+    if (apiType) { updates.push(`api_type = ?`); params.push(apiType); }
     params.push(row.email);
     db.prepare(`UPDATE outlook_accounts SET ${updates.join(', ')} WHERE email = ?`).run(...params);
-    results.push({ email: row.email, valid, apiType });
-  }
+    return { email: row.email, valid, apiType };
+  });
+
+  const results = [
+    ...noToken.map(row => ({ email: row.email, valid: false as const })),
+    ...checked,
+  ];
 
   return c.json({
     checked: results.length,
@@ -154,6 +162,7 @@ outlookRoutes.post('/outlook/check', async (c) => {
 outlookRoutes.post('/outlook/renew', async (c) => {
   const body = await c.req.json().catch(() => ({}));
   const db = getDb();
+  const concurrency = Math.max(1, parseInt(getSetting('batch_concurrency', '5'), 10) || 5);
 
   let sql = `SELECT email, client_id, refresh_token FROM outlook_accounts`;
   if (body.emails?.length) {
@@ -163,23 +172,27 @@ outlookRoutes.post('/outlook/renew', async (c) => {
 
   const rows = allRows<{ email: string; client_id: string; refresh_token: string }>(db, sql, ...(body.emails ?? []));
 
-  const results: { email: string; renewed: boolean }[] = [];
+  const noToken: typeof rows = [];
+  const withToken: typeof rows = [];
   for (const row of rows) {
-    if (!row.client_id || !row.refresh_token) {
-      results.push({ email: row.email, renewed: false });
-      continue;
-    }
+    (row.client_id && row.refresh_token ? withToken : noToken).push(row);
+  }
+
+  const noTokenResults = noToken.map(row => ({ email: row.email, renewed: false }));
+
+  const checked = await runConcurrent(withToken, concurrency, async (row) => {
     const result = await renewToken(row.client_id, row.refresh_token);
     if (result) {
       db.prepare(
         `UPDATE outlook_accounts SET refresh_token = ?, token_status = 'valid', token_renewed_at = datetime('now') WHERE email = ?`,
       ).run(result.newRefreshToken, row.email);
-      results.push({ email: row.email, renewed: true });
-    } else {
-      db.prepare(`UPDATE outlook_accounts SET token_status = 'invalid' WHERE email = ?`).run(row.email);
-      results.push({ email: row.email, renewed: false });
+      return { email: row.email, renewed: true };
     }
-  }
+    db.prepare(`UPDATE outlook_accounts SET token_status = 'invalid' WHERE email = ?`).run(row.email);
+    return { email: row.email, renewed: false };
+  });
+
+  const results = [...noTokenResults, ...checked];
 
   return c.json({
     total: results.length,
@@ -224,6 +237,7 @@ outlookRoutes.get('/outlook/stats', (c) => {
 outlookRoutes.get('/outlook/settings', (c) => {
   return c.json({
     recordFailService: getSetting('outlook_record_fail_service') !== '0',
+    batchConcurrency: parseInt(getSetting('batch_concurrency', '5'), 10) || 5,
   });
 });
 
@@ -232,6 +246,10 @@ outlookRoutes.patch('/outlook/settings', async (c) => {
   if (typeof body.recordFailService === 'boolean') {
     const val = body.recordFailService ? '1' : '0';
     setSetting('outlook_record_fail_service', val);
+  }
+  if (body.batchConcurrency != null) {
+    const val = Math.max(1, Math.min(50, parseInt(body.batchConcurrency, 10) || 5));
+    setSetting('batch_concurrency', String(val));
   }
   return c.json({ ok: true });
 });
