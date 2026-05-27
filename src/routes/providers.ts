@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { registry } from '../providers/registry.js';
 import { rateLimiter } from '../rate-limiter.js';
-import { buildSetClause, getDb, getRow } from '../db.js';
+import { getDb, getRow } from '../db.js';
 import { requireAdmin, type AdminEnv } from './admin.js';
 import { createLogger } from '../logger.js';
 import { errorMessage } from '../errors.js';
@@ -73,14 +73,23 @@ providerRoutes.patch('/providers/:name', requireAdmin, async (c) => {
   const body = await c.req.json().catch(() => ({}));
   const db = getDb();
 
-  const clause = buildSetClause(body, {
-    enabled: (v) => (v ? 1 : 0),
-    priority: (v) => v,
-    autoDispatch: (v) => (v ? 1 : 0),
-  });
-  if (!clause) return c.json({ error: 'No valid fields to update' }, 400);
-  const setClause = clause.setClause + ", updated_at = datetime('now')";
-  const params = [...clause.params, name];
+  const clauses: string[] = [];
+  const params: unknown[] = [];
+  if (body.enabled !== undefined) {
+    clauses.push('enabled = ?');
+    params.push(body.enabled ? 1 : 0);
+  }
+  if (body.priority !== undefined) {
+    clauses.push('priority = ?');
+    params.push(body.priority);
+  }
+  if (body.autoDispatch !== undefined) {
+    clauses.push('auto_dispatch = ?');
+    params.push(body.autoDispatch ? 1 : 0);
+  }
+  if (!clauses.length) return c.json({ error: 'No valid fields to update' }, 400);
+  const setClause = `${clauses.join(', ')}, updated_at = datetime('now')`;
+  params.push(name);
   db.prepare(`UPDATE provider_config SET ${setClause} WHERE provider = ?`).run(...params);
 
   return c.json({ ok: true, ...registry.getConfig(name) });

@@ -48,7 +48,7 @@ class ProviderRegistry {
     return { enabled: row.enabled === 1, priority: row.priority, autoDispatch: row.auto_dispatch !== 0 };
   }
 
-  listMeta(): (ProviderMeta & { enabled: boolean; priority: number })[] {
+  listMeta(): (ProviderMeta & { enabled: boolean; priority: number; autoDispatch: boolean })[] {
     const db = getDb();
     const cfgs = allRows<{ provider: string; enabled: number; priority: number; auto_dispatch: number }>(
       db,
@@ -57,8 +57,8 @@ class ProviderRegistry {
     const cfgMap = new Map(cfgs.map((c) => [c.provider, c]));
     return this.getAll().map((p) => {
       const c = cfgMap.get(p.meta.name);
-      if (!c) return { ...p.meta, enabled: true, priority: 0 };
-      return { ...p.meta, enabled: c.enabled === 1, priority: c.priority };
+      if (!c) return { ...p.meta, enabled: true, priority: 0, autoDispatch: true };
+      return { ...p.meta, enabled: c.enabled === 1, priority: c.priority, autoDispatch: c.auto_dispatch !== 0 };
     });
   }
 }
