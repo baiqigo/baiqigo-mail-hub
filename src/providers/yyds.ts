@@ -2,7 +2,7 @@ import { BaseProvider, PROVIDER, type InboxData, type Message, type MessageDetai
 import { allRows, getDb, getRow } from '../db.js';
 import { fetchWithTimeout, formatSender, todayDateString } from '../utils.js';
 import { createLogger } from '../logger.js';
-import { errorMessage, logIgnoredError } from '../errors.js';
+import { errorMessage, logIgnoredError, UpstreamHttpError } from '../errors.js';
 import type Database from 'better-sqlite3';
 
 const API_BASE = 'https://maliapi.215.im/v1';
@@ -188,6 +188,9 @@ export class YydsProvider extends BaseProvider {
           body: JSON.stringify(body),
         });
 
+        if (res.status === 429) {
+          throw new UpstreamHttpError('YYDS 创建邮箱失败: 429', 429, res.headers.get('Retry-After'));
+        }
         if (res.status === 403) {
           this.markWildcard(selected.apiKey, false);
         } else if (res.ok) {
@@ -210,6 +213,7 @@ export class YydsProvider extends BaseProvider {
           }
         }
       } catch (e) {
+        if (e instanceof UpstreamHttpError && e.status === 429) throw e;
         if (!(e instanceof TypeError)) log.warn('wildcard inbox attempt failed', { error: errorMessage(e) });
       }
     }
@@ -227,7 +231,12 @@ export class YydsProvider extends BaseProvider {
         logIgnoredError(log, 'failed to read YYDS create error response', error);
         return '';
       });
-      throw new Error(`YYDS 创建邮箱失败: ${res.status} ${errText.slice(0, 100)}`);
+      throw new UpstreamHttpError(
+        `YYDS 创建邮箱失败: ${res.status} ${errText.slice(0, 100)}`,
+        res.status,
+        res.headers.get('Retry-After'),
+        errText.slice(0, 500),
+      );
     }
 
     const json = await res.json() as YydsResponse<YydsAccount>;

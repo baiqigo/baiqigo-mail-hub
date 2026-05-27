@@ -11,7 +11,7 @@ import type { BaseProvider, InboxData, Message, MessageDetail } from '../provide
 import { PROVIDER } from '../providers/base.js';
 import type { AdminEnv } from './admin.js';
 import { createLogger } from '../logger.js';
-import { errorMessage } from '../errors.js';
+import { errorMessage, httpStatus } from '../errors.js';
 
 const log = createLogger('inbox-route');
 
@@ -139,7 +139,8 @@ inboxRoutes.post('/inbox', async (c) => {
     return c.json(result, 201);
   } catch (e) {
     const msg = errorMessage(e);
-    const status = msg.includes('rate-limit') || msg.includes('rate limited') ? 429
+    const upstreamStatus = httpStatus(e, 0);
+    const status = upstreamStatus === 429 || msg.includes('rate-limit') || msg.includes('rate limited') ? 429
       : msg.includes('not found') || msg.includes('not available') || msg.includes('example domain') ? 400
       : 503;
     return c.json({ error: msg }, status);

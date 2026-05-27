@@ -1,7 +1,7 @@
 import { BaseProvider, type ProviderMeta, type InboxData, type Message, type MessageDetail } from './base.js';
 import { fetchWithTimeout, randomString } from '../utils.js';
 import { createLogger } from '../logger.js';
-import { errorMessage } from '../errors.js';
+import { errorMessage, UpstreamHttpError } from '../errors.js';
 
 type JsonMap = Record<string, unknown>;
 const log = createLogger('template-provider');
@@ -144,6 +144,8 @@ function interpolateBody(body: JsonMap, vars: Record<string, string>): JsonMap {
 export class TemplateProvider extends BaseProvider {
   meta: ProviderMeta;
   private cfg: TemplateProviderConfig;
+  private domainCache: { domains: string[]; expiresAt: number } | null = null;
+  private static readonly DOMAIN_CACHE_MS = 5 * 60_000;
 
   constructor(cfg: TemplateProviderConfig) {
     super();
@@ -158,6 +160,10 @@ export class TemplateProvider extends BaseProvider {
       retention: cfg.retention,
       features: { ...cfg.features, realtime: false },
     };
+  }
+
+  getDomainMode(): TemplateProviderConfig['domains']['mode'] {
+    return this.cfg.domains.mode;
   }
 
   private buildGlobalHeaders(): Record<string, string> {
@@ -201,6 +207,10 @@ export class TemplateProvider extends BaseProvider {
       }
     }
 
+    if (this.domainCache && this.domainCache.expiresAt > Date.now()) {
+      return this.domainCache.domains;
+    }
+
     const url = this.buildUrl(domains.path ?? '/domains', {}, 'provider');
     const headers = this.buildGlobalHeaders();
     const rawBody = domains.body ? interpolateBody(domains.body, {}) : undefined;
@@ -216,10 +226,12 @@ export class TemplateProvider extends BaseProvider {
     if (domains.filter) {
       items = items.filter((item) => resolvePath(item, domains.filter!.field) === domains.filter!.equals);
     }
-    if (domains.domainField) return items
+    const resolvedDomains = domains.domainField ? items
       .map((item) => resolvePath(item, domains.domainField!))
-      .filter((domain): domain is string => typeof domain === 'string' && Boolean(domain));
-    return items.filter((item): item is string => typeof item === 'string');
+      .filter((domain): domain is string => typeof domain === 'string' && Boolean(domain))
+      : items.filter((item): item is string => typeof item === 'string');
+    this.domainCache = { domains: resolvedDomains, expiresAt: Date.now() + TemplateProvider.DOMAIN_CACHE_MS };
+    return resolvedDomains;
   }
 
   async createInbox(opts?: { domain?: string; username?: string }): Promise<InboxData> {
@@ -247,7 +259,15 @@ export class TemplateProvider extends BaseProvider {
         fetchOpts.body = serialized.body;
       }
       const res = await fetchWithTimeout(url, fetchOpts);
-      if (!res.ok) throw new Error(`[${this.cfg.name}] Create failed: ${res.status}`);
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        throw new UpstreamHttpError(
+          `[${this.cfg.name}] Create failed: ${res.status}`,
+          res.status,
+          res.headers.get('Retry-After'),
+          body.slice(0, 500),
+        );
+      }
       data = await res.json();
     }
 

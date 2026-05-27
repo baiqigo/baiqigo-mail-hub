@@ -25,10 +25,42 @@ export function errorCode(error: unknown): string | undefined {
   return typeof code === 'string' ? code : undefined;
 }
 
+export class UpstreamHttpError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly retryAfter?: string | null,
+    readonly body?: string,
+  ) {
+    super(message);
+    this.name = 'UpstreamHttpError';
+  }
+}
+
 export function httpStatus(error: unknown, fallback = 500): number {
   if (!error || typeof error !== 'object' || !('status' in error)) return fallback;
   const status = (error as { status?: unknown }).status;
   return typeof status === 'number' ? status : fallback;
+}
+
+export function retryAfterHeader(error: unknown): string | undefined {
+  if (!error || typeof error !== 'object' || !('retryAfter' in error)) return undefined;
+  const retryAfter = (error as { retryAfter?: unknown }).retryAfter;
+  return typeof retryAfter === 'string' ? retryAfter : undefined;
+}
+
+export function isRateLimitError(error: unknown): boolean {
+  if (httpStatus(error, 0) === 429) return true;
+  return /\b429\b|rate[- ]?limit|too many requests/i.test(errorMessage(error));
+}
+
+export function isTransientUpstreamError(error: unknown): boolean {
+  const status = httpStatus(error, 0);
+  if (status >= 500 && status < 600) return true;
+  if (error instanceof TypeError) return true;
+  if (error instanceof DOMException && error.name === 'TimeoutError') return true;
+  const code = errorCode(error);
+  return !!code && /^(ECONNRESET|ECONNREFUSED|ECONNABORTED|ETIMEDOUT|EPIPE|EAI_AGAIN|UND_ERR_CONNECT_TIMEOUT|UND_ERR_SOCKET|UND_ERR_HEADERS_TIMEOUT)$/.test(code);
 }
 
 export function jsonStatus(status: number): ContentfulStatusCode {

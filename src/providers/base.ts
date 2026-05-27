@@ -50,8 +50,14 @@ export interface MessageDetail extends Message {
   html?: string;
 }
 
+export type ProviderDomainMode = 'endpoint' | 'static' | 'from_create';
+
 export abstract class BaseProvider {
   abstract meta: ProviderMeta;
+
+  getDomainMode(): ProviderDomainMode {
+    return 'endpoint';
+  }
 
   abstract getDomains(opts?: { for?: string }): Promise<string[]>;
   abstract createInbox(opts?: { domain?: string; username?: string; for?: string; subdomain?: string; inboxId?: string }): Promise<InboxData>;

@@ -3,7 +3,7 @@ import { registry } from './providers/registry.js';
 import { rateLimiter } from './rate-limiter.js';
 import { allRows, getDb, getRow } from './db.js';
 import { PROVIDER, type ProviderName, type BaseProvider, type InboxData } from './providers/base.js';
-import { errorMessage } from './errors.js';
+import { errorMessage, httpStatus, isTransientUpstreamError, retryAfterHeader } from './errors.js';
 
 const PROVIDER_PAIRS: Partial<Record<string, ProviderName[]>> = {
   [PROVIDER.MAILTM]: [PROVIDER.MAILGW],
@@ -38,6 +38,18 @@ interface ProviderScore {
 }
 
 const domainCursor = new Map<string, number>();
+
+function canCreateWithoutPreselectedDomain(provider: BaseProvider): boolean {
+  return provider.getDomainMode() === 'from_create';
+}
+
+function recordProviderFailure(providerName: string, error: unknown): void {
+  if (httpStatus(error, 0) === 429) {
+    rateLimiter.recordRateLimitFailure(providerName, retryAfterHeader(error));
+  } else if (isTransientUpstreamError(error)) {
+    rateLimiter.recordTransientFailure(providerName);
+  }
+}
 
 export function getDomainAtLevel(domain: string, level: number): string {
   const parts = domain.split('.');
@@ -84,6 +96,7 @@ async function selectAllowedDomain(
   }
 
   if (provider.meta.type === 'alias') return undefined;
+  if (canCreateWithoutPreselectedDomain(provider)) return undefined;
 
   const domains = await provider.getDomains(targetService ? { for: targetService } : undefined);
   const allowed = domains.filter((d) => !isDomainBlocked(d, blockedDomains));
@@ -135,15 +148,17 @@ async function scoreProviders(
     if (rateOk) score += 15;
     score -= Math.min(stats.fail, 10) * 5;
 
-    let domains: string[];
-    try {
-      domains = await p.getDomains(targetService ? { for: targetService } : undefined);
-    } catch (e) {
-      domains = [];
-      console.warn(`[dispatcher] getDomains failed for ${p.meta.name}:`, (e as Error)?.message);
+    let domains: string[] = [];
+    let unblocked: string[] = [];
+    if (rateOk && !canCreateWithoutPreselectedDomain(p)) {
+      try {
+        domains = await p.getDomains(targetService ? { for: targetService } : undefined);
+      } catch (e) {
+        console.warn(`[dispatcher] getDomains failed for ${p.meta.name}:`, (e as Error)?.message);
+      }
+      unblocked = domains.filter((d) => !isDomainBlocked(d, blockedDomains));
+      if (unblocked.length > 0) score += 20;
     }
-    const unblocked = domains.filter((d) => !isDomainBlocked(d, blockedDomains));
-    if (unblocked.length > 0) score += 20;
 
     let reason = `trust=${p.meta.trustLevel}`;
     if (!rateOk) reason += ', rate-limited';
@@ -199,6 +214,9 @@ async function tryCreateInbox(
     ...(opts.duration ? { duration: opts.duration } : {}),
     inboxId: id,
   };
+  if (!rateLimiter.tryRecordCreate(providerName)) {
+    throw new Error(`Provider '${providerName}' is rate-limited`);
+  }
   const inbox = await provider.createInbox(createOpts);
   try {
     saveInbox(id, inbox, opts.for, opts.ownerKey);
@@ -206,7 +224,7 @@ async function tryCreateInbox(
     await provider.releaseInbox(inbox, id).catch(() => {});
     throw error;
   }
-  rateLimiter.recordCreate(providerName);
+  rateLimiter.recordCreateSuccess(providerName);
   return {
     id,
     address: inbox.address,
@@ -237,7 +255,12 @@ export async function dispatch(opts: DispatchOptions): Promise<DispatchResult> {
       ? await selectAllowedDomain(p, opts.domain, blockedDomains, opts.for)
       : await selectAllowedDomain(p, undefined, blockedDomains, opts.for);
 
-    return tryCreateInbox(p, p.meta.name, opts, domain);
+    try {
+      return await tryCreateInbox(p, p.meta.name, opts, domain);
+    } catch (error) {
+      recordProviderFailure(p.meta.name, error);
+      throw error;
+    }
   }
 
   const blockedDomains = opts.for ? getBlockedDomains(opts.for) : new Set<string>();
@@ -252,13 +275,18 @@ export async function dispatch(opts: DispatchOptions): Promise<DispatchResult> {
         const pairCfg = registry.getConfig(pairName);
         if (pair && pairCfg.enabled && rateLimiter.isCreateAvailable(pairName)) {
           try {
-            let domains = await pair.getDomains(opts.for ? { for: opts.for } : undefined);
-            domains = domains.filter((d) => !isDomainBlocked(d, blockedDomains));
-            if (domains.length === 0) continue;
+            let domain: string | undefined;
+            if (!canCreateWithoutPreselectedDomain(pair)) {
+              let domains = await pair.getDomains(opts.for ? { for: opts.for } : undefined);
+              domains = domains.filter((d) => !isDomainBlocked(d, blockedDomains));
+              if (domains.length === 0) continue;
+              domain = domains.length ? pickDomain(pairName, domains) : undefined;
+            }
 
-            return tryCreateInbox(pair, pairName, opts, pickDomain(pairName, domains));
+            return await tryCreateInbox(pair, pairName, opts, domain);
           } catch (e) {
             errors.push(`${pairName}(pair): ${errorMessage(e)}`);
+            recordProviderFailure(pairName, e);
             continue;
           }
         }
@@ -268,18 +296,22 @@ export async function dispatch(opts: DispatchOptions): Promise<DispatchResult> {
     }
 
     try {
-      let domains = await p.getDomains(opts.for ? { for: opts.for } : undefined);
-      domains = domains.filter((d) => !isDomainBlocked(d, blockedDomains));
+      let domain: string | undefined;
+      if (!canCreateWithoutPreselectedDomain(p)) {
+        let domains = await p.getDomains(opts.for ? { for: opts.for } : undefined);
+        domains = domains.filter((d) => !isDomainBlocked(d, blockedDomains));
 
-      if (domains.length === 0 && p.meta.type !== 'alias') {
-        errors.push(`${p.meta.name}: all domains blocked`);
-        continue;
+        if (domains.length === 0 && p.meta.type !== 'alias') {
+          errors.push(`${p.meta.name}: all domains blocked`);
+          continue;
+        }
+        domain = domains.length ? pickDomain(p.meta.name, domains) : undefined;
       }
 
-      return tryCreateInbox(p, p.meta.name, opts, pickDomain(p.meta.name, domains));
+      return await tryCreateInbox(p, p.meta.name, opts, domain);
     } catch (e) {
       errors.push(`${p.meta.name}: ${errorMessage(e)}`);
-      rateLimiter.setCooldown(p.meta.name, Date.now() + 60_000);
+      recordProviderFailure(p.meta.name, e);
     }
   }
 
