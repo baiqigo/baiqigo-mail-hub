@@ -6,6 +6,7 @@ import { createLogger } from '../logger.js';
 import { errorMessage, logIgnoredError } from '../errors.js';
 
 const log = createLogger('imap');
+const GMAIL_DOMAINS = new Set(['gmail.com', 'googlemail.com']);
 
 interface ImapAccount {
   id: string;
@@ -39,6 +40,21 @@ function getAccountByDomain(domain: string): ImapAccount | undefined {
     `SELECT id, host, port, user, password, domain, tls, status FROM imap_accounts WHERE domain = ? AND status = 'active' LIMIT 1`,
     domain,
   );
+}
+
+function localPart(address: string): string {
+  return address.split('@', 1)[0].trim().toLowerCase();
+}
+
+function isGmailAliasAccount(account: ImapAccount): boolean {
+  const accountDomain = account.domain.trim().toLowerCase();
+  const userDomain = account.user.split('@')[1]?.trim().toLowerCase() ?? '';
+  return GMAIL_DOMAINS.has(accountDomain) && GMAIL_DOMAINS.has(userDomain);
+}
+
+function gmailAliasUsername(account: ImapAccount): string {
+  const base = localPart(account.user).replace(/\./g, '');
+  return `${base}+mh${randomString(8)}`;
 }
 
 async function connectImap(account: ImapAccount): Promise<ImapFlow> {
@@ -116,7 +132,7 @@ export class ImapProvider extends BaseProvider {
       account = accounts[Math.floor(Math.random() * accounts.length)];
     }
 
-    const username = opts?.username || randomString(12);
+    const username = opts?.username || (isGmailAliasAccount(account) ? gmailAliasUsername(account) : randomString(12));
 
     return {
       address: `${username}@${account.domain}`,

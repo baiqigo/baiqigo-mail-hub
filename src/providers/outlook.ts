@@ -74,12 +74,28 @@ async function fetchOAuthToken(clientId: string, refreshToken: string): Promise<
   return { accessToken, newRefreshToken: data.refresh_token };
 }
 
-async function obtainAccessToken(clientId: string, refreshToken: string): Promise<string | null> {
+function persistRefreshToken(email: string | undefined, clientId: string, oldRefreshToken: string, newRefreshToken: string | undefined, accessToken: string): void {
+  if (!email || !newRefreshToken || newRefreshToken === oldRefreshToken) return;
+
+  const info = getDb().prepare(
+    `UPDATE outlook_accounts
+     SET refresh_token = ?, token_status = 'valid', token_renewed_at = datetime('now')
+     WHERE email = ? AND refresh_token = ?`,
+  ).run(newRefreshToken, email, oldRefreshToken);
+
+  if (info.changes > 0) {
+    evictCachedToken(clientId, oldRefreshToken);
+    setCachedToken(clientId, newRefreshToken, accessToken);
+  }
+}
+
+async function obtainAccessToken(clientId: string, refreshToken: string, email?: string): Promise<string | null> {
   const cached = getCachedToken(clientId, refreshToken);
   if (cached) return cached;
   const result = await fetchOAuthToken(clientId, refreshToken);
   if (!result) return null;
-  setCachedToken(clientId, refreshToken, result.accessToken);
+  persistRefreshToken(email, clientId, refreshToken, result.newRefreshToken, result.accessToken);
+  setCachedToken(clientId, result.newRefreshToken || refreshToken, result.accessToken);
   return result.accessToken;
 }
 
@@ -302,7 +318,7 @@ export class OutlookProvider extends BaseProvider {
     const freshToken = this.getFreshRefreshToken(email) || inbox.authData.refreshToken;
     const db = getDb();
     const apiType = getRow<{ api_type: string }>(db, `SELECT api_type FROM outlook_accounts WHERE email = ?`, email)?.api_type || '';
-    let accessToken = await obtainAccessToken(clientId, freshToken);
+    let accessToken = await obtainAccessToken(clientId, freshToken, email);
     if (!accessToken) throw new Error('OAuth2 认证失败');
 
     try {
@@ -314,7 +330,8 @@ export class OutlookProvider extends BaseProvider {
     } catch (e) {
       if (errorMessage(e).includes('401')) {
         evictCachedToken(clientId, freshToken);
-        accessToken = await obtainAccessToken(clientId, freshToken);
+        const retryToken = this.getFreshRefreshToken(email) || freshToken;
+        accessToken = await obtainAccessToken(clientId, retryToken, email);
         if (!accessToken) throw new Error('OAuth2 认证失败，令牌已过期');
         const result = await fetchMailsBothApis(accessToken, apiType);
         if (result.apiType && result.apiType !== apiType) {
@@ -332,7 +349,7 @@ export class OutlookProvider extends BaseProvider {
     const freshToken = this.getFreshRefreshToken(email) || inbox.authData.refreshToken;
     const apiType = getRow<{ api_type: string }>(getDb(), `SELECT api_type FROM outlook_accounts WHERE email = ?`, email)?.api_type || '';
 
-    let accessToken = await obtainAccessToken(clientId, freshToken);
+    let accessToken = await obtainAccessToken(clientId, freshToken, email);
     if (!accessToken) throw new Error('OAuth2 认证失败');
 
     try {
@@ -341,7 +358,8 @@ export class OutlookProvider extends BaseProvider {
     } catch (e) {
       if (errorMessage(e).includes('401')) {
         evictCachedToken(clientId, freshToken);
-        accessToken = await obtainAccessToken(clientId, freshToken);
+        const retryToken = this.getFreshRefreshToken(email) || freshToken;
+        accessToken = await obtainAccessToken(clientId, retryToken, email);
         if (!accessToken) throw new Error('OAuth2 认证失败，令牌已过期');
         const msg = await fetchSingleMessage(accessToken, messageId, apiType);
         return graphMsgToDetail(msg);
@@ -364,7 +382,7 @@ export class OutlookProvider extends BaseProvider {
 }
 
 export async function checkToken(email: string, clientId: string, refreshToken: string): Promise<{ valid: boolean; apiType: string }> {
-  const token = await obtainAccessToken(clientId, refreshToken);
+  const token = await obtainAccessToken(clientId, refreshToken, email);
   if (!token) return { valid: false, apiType: '' };
 
   try {
@@ -387,5 +405,6 @@ export async function checkToken(email: string, clientId: string, refreshToken: 
 export async function renewToken(clientId: string, refreshToken: string): Promise<{ newRefreshToken: string; accessToken: string } | null> {
   const result = await fetchOAuthToken(clientId, refreshToken);
   if (!result || !result.newRefreshToken) return null;
+  evictCachedToken(clientId, refreshToken);
   return { newRefreshToken: result.newRefreshToken, accessToken: result.accessToken };
 }
