@@ -1,5 +1,7 @@
-FROM node:20-alpine AS build
-RUN apk add --no-cache python3 make g++
+FROM node:20-bookworm-slim AS build
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 make g++ ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci || npm install
@@ -8,8 +10,7 @@ COPY src ./src
 RUN npm run build
 RUN npm prune --omit=dev
 
-FROM node:20-alpine
-RUN apk add --no-cache libstdc++
+FROM node:20-bookworm-slim
 WORKDIR /app
 COPY --from=build /app/package.json ./
 COPY --from=build /app/node_modules ./node_modules
