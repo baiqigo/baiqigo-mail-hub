@@ -1,7 +1,7 @@
 import { randomUUID } from 'crypto';
+import { ImapFlow } from 'imapflow';
 import { BaseProvider, PROVIDER, type InboxData, type Message, type MessageDetail, type ProviderMeta } from './base.js';
 import { allRows, getDb, getRow } from '../db.js';
-import { createConnection } from 'net';
 import { fetchWithTimeout, formatSender } from '../utils.js';
 import { errorMessage } from '../errors.js';
 
@@ -12,6 +12,7 @@ const OUTLOOK_INBOX_URL = 'https://outlook.office.com/api/v2.0/me/mailfolders/in
 const OUTLOOK_JUNK_URL = 'https://outlook.office.com/api/v2.0/me/mailfolders/junkemail/messages';
 const IMAP_HOST = 'outlook.office365.com';
 const IMAP_PORT = 993;
+const IMAP_SCOPE = 'https://outlook.office.com/IMAP.AccessAsUser.All offline_access';
 
 const TOKEN_TTL = 55 * 60 * 1000;
 const tokenCache = new Map<string, { token: string; expiresAt: number }>();
@@ -37,30 +38,32 @@ const ALLOCABLE_ACCOUNT_WHERE = `assigned_inbox_id IS NULL
   AND refresh_token != ''
   AND COALESCE(token_status, '') NOT IN ('invalid', 'no_token', 'pending_oauth')`;
 
-function cacheKey(clientId: string, refreshToken: string): string {
-  return `${clientId}:${refreshToken.slice(-8)}`;
+function cacheKey(clientId: string, refreshToken: string, scope = ''): string {
+  return `${clientId}:${scope}:${refreshToken.slice(-8)}`;
 }
 
-function getCachedToken(clientId: string, refreshToken: string): string | null {
-  const entry = tokenCache.get(cacheKey(clientId, refreshToken));
+function getCachedToken(clientId: string, refreshToken: string, scope = ''): string | null {
+  const entry = tokenCache.get(cacheKey(clientId, refreshToken, scope));
   if (entry && Date.now() < entry.expiresAt) return entry.token;
   return null;
 }
 
-function setCachedToken(clientId: string, refreshToken: string, token: string): void {
-  tokenCache.set(cacheKey(clientId, refreshToken), { token, expiresAt: Date.now() + TOKEN_TTL });
+function setCachedToken(clientId: string, refreshToken: string, token: string, scope = ''): void {
+  tokenCache.set(cacheKey(clientId, refreshToken, scope), { token, expiresAt: Date.now() + TOKEN_TTL });
 }
 
 export function evictCachedToken(clientId: string, refreshToken: string): void {
   tokenCache.delete(cacheKey(clientId, refreshToken));
+  tokenCache.delete(cacheKey(clientId, refreshToken, IMAP_SCOPE));
 }
 
-async function fetchOAuthToken(clientId: string, refreshToken: string): Promise<{ accessToken: string; newRefreshToken?: string } | null> {
+async function fetchOAuthToken(clientId: string, refreshToken: string, scope = ''): Promise<{ accessToken: string; newRefreshToken?: string } | null> {
   const body = new URLSearchParams({
     client_id: clientId,
     refresh_token: refreshToken,
     grant_type: 'refresh_token',
   });
+  if (scope) body.set('scope', scope);
   const res = await fetchWithTimeout(OAUTH2_URL, {
     timeout: 10000,
     method: 'POST',
@@ -74,7 +77,7 @@ async function fetchOAuthToken(clientId: string, refreshToken: string): Promise<
   return { accessToken, newRefreshToken: data.refresh_token };
 }
 
-function persistRefreshToken(email: string | undefined, clientId: string, oldRefreshToken: string, newRefreshToken: string | undefined, accessToken: string): void {
+function persistRefreshToken(email: string | undefined, clientId: string, oldRefreshToken: string, newRefreshToken: string | undefined, accessToken: string, scope = ''): void {
   if (!email || !newRefreshToken || newRefreshToken === oldRefreshToken) return;
 
   const info = getDb().prepare(
@@ -85,17 +88,17 @@ function persistRefreshToken(email: string | undefined, clientId: string, oldRef
 
   if (info.changes > 0) {
     evictCachedToken(clientId, oldRefreshToken);
-    setCachedToken(clientId, newRefreshToken, accessToken);
+    setCachedToken(clientId, newRefreshToken, accessToken, scope);
   }
 }
 
-async function obtainAccessToken(clientId: string, refreshToken: string, email?: string): Promise<string | null> {
-  const cached = getCachedToken(clientId, refreshToken);
+async function obtainAccessToken(clientId: string, refreshToken: string, email?: string, scope = ''): Promise<string | null> {
+  const cached = getCachedToken(clientId, refreshToken, scope);
   if (cached) return cached;
-  const result = await fetchOAuthToken(clientId, refreshToken);
+  const result = await fetchOAuthToken(clientId, refreshToken, scope);
   if (!result) return null;
-  persistRefreshToken(email, clientId, refreshToken, result.newRefreshToken, result.accessToken);
-  setCachedToken(clientId, result.newRefreshToken || refreshToken, result.accessToken);
+  persistRefreshToken(email, clientId, refreshToken, result.newRefreshToken, result.accessToken, scope);
+  setCachedToken(clientId, result.newRefreshToken || refreshToken, result.accessToken, scope);
   return result.accessToken;
 }
 
@@ -209,6 +212,84 @@ function graphMsgToDetail(msg: GraphMessage): MessageDetail {
   };
 }
 
+async function withOutlookImap<T>(email: string, accessToken: string, fn: (client: ImapFlow) => Promise<T>): Promise<T> {
+  const client = new ImapFlow({
+    host: IMAP_HOST,
+    port: IMAP_PORT,
+    secure: true,
+    auth: { user: email, accessToken },
+    logger: false,
+  });
+  await client.connect();
+  try {
+    return await fn(client);
+  } finally {
+    await client.logout().catch(() => undefined);
+  }
+}
+
+async function fetchMailsImap(email: string, accessToken: string, count = 20): Promise<Message[]> {
+  return withOutlookImap(email, accessToken, async (client) => {
+    const lock = await client.getMailboxLock('INBOX');
+    try {
+      const uids = await client.search({}, { uid: true });
+      const latest = (uids || []).slice(-count).reverse();
+      const messages: Message[] = [];
+      for (const uid of latest) {
+        const fetched = await client.fetchOne(String(uid), {
+          uid: true,
+          envelope: true,
+          bodyStructure: true,
+        }, { uid: true });
+        if (!fetched) continue;
+        messages.push({
+          id: `imap:INBOX:${uid}`,
+          from: fetched.envelope?.from?.[0]?.address ?? '',
+          subject: fetched.envelope?.subject ?? '',
+          excerpt: '',
+          receivedAt: fetched.envelope?.date?.toISOString() ?? '',
+        });
+      }
+      return messages;
+    } finally {
+      lock.release();
+    }
+  });
+}
+
+async function fetchSingleMessageImap(email: string, accessToken: string, messageId: string): Promise<MessageDetail> {
+  const [, mailbox = 'INBOX', uid = ''] = messageId.split(':');
+  if (!uid) throw new Error(`Invalid IMAP message id: ${messageId}`);
+  return withOutlookImap(email, accessToken, async (client) => {
+    const lock = await client.getMailboxLock(mailbox);
+    try {
+      const fetched = await client.fetchOne(uid, {
+        uid: true,
+        envelope: true,
+        bodyParts: ['1', '1.1', '1.2', '2'],
+      }, { uid: true });
+      if (!fetched) throw new Error(`Message ${messageId} not found`);
+      const parts = ['1', '1.1', '1.2', '2']
+        .map(part => {
+          try { return fetched.bodyParts?.get(part)?.toString() || ''; } catch { return ''; }
+        })
+        .filter(Boolean);
+      const body = parts.join('\n\n');
+      return {
+        id: messageId,
+        from: fetched.envelope?.from?.[0]?.address ?? '',
+        subject: fetched.envelope?.subject ?? '',
+        excerpt: body.slice(0, 200),
+        receivedAt: fetched.envelope?.date?.toISOString() ?? '',
+        text: body,
+        html: '',
+      };
+    } finally {
+      lock.release();
+    }
+  });
+}
+
 export class OutlookProvider extends BaseProvider {
   meta: ProviderMeta = {
     name: PROVIDER.OUTLOOK,
@@ -318,10 +399,9 @@ export class OutlookProvider extends BaseProvider {
     const freshToken = this.getFreshRefreshToken(email) || inbox.authData.refreshToken;
     const db = getDb();
     const apiType = getRow<{ api_type: string }>(db, `SELECT api_type FROM outlook_accounts WHERE email = ?`, email)?.api_type || '';
-    let accessToken = await obtainAccessToken(clientId, freshToken, email);
-    if (!accessToken) throw new Error('OAuth2 认证失败');
-
     try {
+      let accessToken = await obtainAccessToken(clientId, freshToken, email);
+      if (!accessToken) throw new Error('OAuth2 认证失败');
       const result = await fetchMailsBothApis(accessToken, apiType);
       if (result.apiType && result.apiType !== apiType) {
         db.prepare(`UPDATE outlook_accounts SET api_type = ? WHERE email = ?`).run(result.apiType, email);
@@ -331,7 +411,7 @@ export class OutlookProvider extends BaseProvider {
       if (errorMessage(e).includes('401')) {
         evictCachedToken(clientId, freshToken);
         const retryToken = this.getFreshRefreshToken(email) || freshToken;
-        accessToken = await obtainAccessToken(clientId, retryToken, email);
+        const accessToken = await obtainAccessToken(clientId, retryToken, email);
         if (!accessToken) throw new Error('OAuth2 认证失败，令牌已过期');
         const result = await fetchMailsBothApis(accessToken, apiType);
         if (result.apiType && result.apiType !== apiType) {
@@ -339,7 +419,11 @@ export class OutlookProvider extends BaseProvider {
         }
         return result.messages.map(graphMsgToMessage);
       }
-      throw e;
+      const imapToken = await obtainAccessToken(clientId, this.getFreshRefreshToken(email) || freshToken, email, IMAP_SCOPE);
+      if (!imapToken) throw e;
+      const messages = await fetchMailsImap(email, imapToken);
+      db.prepare(`UPDATE outlook_accounts SET api_type = ? WHERE email = ?`).run('imap', email);
+      return messages;
     }
   }
 
@@ -349,22 +433,29 @@ export class OutlookProvider extends BaseProvider {
     const freshToken = this.getFreshRefreshToken(email) || inbox.authData.refreshToken;
     const apiType = getRow<{ api_type: string }>(getDb(), `SELECT api_type FROM outlook_accounts WHERE email = ?`, email)?.api_type || '';
 
-    let accessToken = await obtainAccessToken(clientId, freshToken, email);
-    if (!accessToken) throw new Error('OAuth2 认证失败');
-
     try {
+      if (messageId.startsWith('imap:')) {
+        const imapToken = await obtainAccessToken(clientId, freshToken, email, IMAP_SCOPE);
+        if (!imapToken) throw new Error('OAuth2 认证失败');
+        return fetchSingleMessageImap(email, imapToken, messageId);
+      }
+      let accessToken = await obtainAccessToken(clientId, freshToken, email);
+      if (!accessToken) throw new Error('OAuth2 认证失败');
       const msg = await fetchSingleMessage(accessToken, messageId, apiType);
       return graphMsgToDetail(msg);
     } catch (e) {
       if (errorMessage(e).includes('401')) {
         evictCachedToken(clientId, freshToken);
         const retryToken = this.getFreshRefreshToken(email) || freshToken;
-        accessToken = await obtainAccessToken(clientId, retryToken, email);
+        const accessToken = await obtainAccessToken(clientId, retryToken, email);
         if (!accessToken) throw new Error('OAuth2 认证失败，令牌已过期');
         const msg = await fetchSingleMessage(accessToken, messageId, apiType);
         return graphMsgToDetail(msg);
       }
-      throw e;
+      if (!messageId.startsWith('imap:')) throw e;
+      const imapToken = await obtainAccessToken(clientId, this.getFreshRefreshToken(email) || freshToken, email, IMAP_SCOPE);
+      if (!imapToken) throw e;
+      return fetchSingleMessageImap(email, imapToken, messageId);
     }
   }
 
@@ -399,11 +490,21 @@ export async function checkToken(email: string, clientId: string, refreshToken: 
     if (res.ok) return { valid: true, apiType: 'outlook' };
   } catch {}
 
+  const imapToken = await obtainAccessToken(clientId, refreshToken, email, IMAP_SCOPE);
+  if (imapToken) {
+    try {
+      await withOutlookImap(email, imapToken, async (client) => {
+        await client.mailboxOpen('INBOX');
+      });
+      return { valid: true, apiType: 'imap' };
+    } catch {}
+  }
+
   return { valid: false, apiType: '' };
 }
 
 export async function renewToken(clientId: string, refreshToken: string): Promise<{ newRefreshToken: string; accessToken: string } | null> {
-  const result = await fetchOAuthToken(clientId, refreshToken);
+  const result = await fetchOAuthToken(clientId, refreshToken, IMAP_SCOPE);
   if (!result || !result.newRefreshToken) return null;
   evictCachedToken(clientId, refreshToken);
   return { newRefreshToken: result.newRefreshToken, accessToken: result.accessToken };
