@@ -11,4 +11,5 @@ services:
       - PORT=3100
       - HOST=0.0.0.0
       - DB_PATH=/app/data/mail.db
+      - PROXY_URL=${PROXY_URL:-}
     restart: unless-stopped
