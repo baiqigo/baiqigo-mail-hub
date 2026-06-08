@@ -2,8 +2,7 @@ services:
   mail-hub:
     build: .
     image: baiqigo-mail-hub:local
-    ports:
-      - "3100:3100"
+    network_mode: host
     volumes:
       - ./data:/app/data
     environment:
